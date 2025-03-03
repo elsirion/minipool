@@ -70,7 +70,10 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let config = Config::parse();
-    info!("Starting minipool with config: {:?}", config);
+    info!(
+        "Starting minipool with config: bitcoin-rpc-user={:?}, bitcoin-rpc-url={:?}",
+        config.bitcoin_rpc_user, config.bitcoin_rpc_url
+    );
 
     let metrics_server = metrics::start_metrics_server(config.prometheus_bind_addr);
     let main_server = start_main_server(config);
