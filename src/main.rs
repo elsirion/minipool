@@ -89,6 +89,7 @@ async fn start_main_server(config: Config) -> Result<()> {
     )?;
 
     let routes = vec![
+        RouteInfo::new("/health", "Useful for health check", get(get_tip_height)),
         RouteInfo::new(
             "/api/blocks/tip/height",
             "Get the current blockchain tip height.",
