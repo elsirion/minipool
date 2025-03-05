@@ -52,10 +52,5 @@ jobs:
         uses: DeterminateSystems/nix-installer-action@v4
       - name: Magic Nix Cache
         uses: DeterminateSystems/magic-nix-cache-action@v2
-      - name: Cargo Cache
-        uses: actions/cache@v3
-        with:
-          key: ${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          path: ~/.cargo
       - name: Run flake checks (fmt, clippy, audit, ...)
         run: 'nix flake check'

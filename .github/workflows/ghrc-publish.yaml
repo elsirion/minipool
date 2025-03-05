@@ -27,7 +27,7 @@ jobs:
       - name: Build minipool
         run: |
           nix build -L .#minipool
-      - name: Build fedimint-observer
+      - name: Build minipool
         run: |
           nix build -L .#minipool-image
           echo "minipool_image_tag=$(docker load < result | awk '{ print $3 }')" >> $GITHUB_ENV
