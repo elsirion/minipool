@@ -373,27 +373,35 @@ async fn get_block_by_height(
     }
 }
 
-fn get_fee_rate_blocking(rpc: &Client, blocks: u16) -> Result<f64, bitcoincore_rpc::Error> {
+/// Convert fee rate from Bitcoin Core format (BTC/kB) to esplora format (sat/vB)
+fn btc_per_kb_to_sat_per_vb(fee_rate: bitcoincore_rpc::bitcoin::Amount) -> f64 {
+    // BTC/kB to sat/vB: multiply by 100_000_000 (sats/BTC), divide by 1000 (bytes/kB)
+    // Simplified: sat/kB / 1000 = sat/vB
+    fee_rate.to_sat() as f64 / 1000.0
+}
+
+fn get_fee_rate_blocking(rpc: &Client, blocks: u16) -> Result<Option<f64>, bitcoincore_rpc::Error> {
     let estimate = rpc.estimate_smart_fee(blocks, None)?;
-    Ok(estimate
-        .fee_rate
-        .map(|fee_rate: bitcoincore_rpc::bitcoin::Amount| fee_rate.to_btc())
-        .unwrap_or_else(|| {
-            warn!(
-                "No fee rate estimate available for {} blocks, using default",
-                blocks
-            );
-            0.0001
-        }))
+    Ok(estimate.fee_rate.map(btc_per_kb_to_sat_per_vb))
 }
 
 async fn get_fee_estimates(State(state): State<AppState>) -> impl IntoResponse {
     let rpc = state.rpc.clone();
     match tokio::task::spawn_blocking(move || {
-        CONFIRMATION_TARGETS
+        let estimates: BTreeMap<String, f64> = CONFIRMATION_TARGETS
             .iter()
-            .map(|&blocks| Ok((blocks.to_string(), get_fee_rate_blocking(&rpc, blocks)?)))
-            .collect::<Result<BTreeMap<_, _>, bitcoincore_rpc::Error>>()
+            .filter_map(|&blocks| {
+                match get_fee_rate_blocking(&rpc, blocks) {
+                    Ok(Some(fee)) => Some((blocks.to_string(), fee)),
+                    Ok(None) => None, // No estimate available, skip this target
+                    Err(e) => {
+                        warn!("Error getting fee estimate for {} blocks: {}", blocks, e);
+                        None
+                    }
+                }
+            })
+            .collect();
+        Ok::<_, bitcoincore_rpc::Error>(estimates)
     })
     .await
     {
@@ -1052,5 +1060,37 @@ mod tests {
         // Position out of bounds should return empty
         let proof = compute_merkle_proof(&txids, 5);
         assert!(proof.is_empty());
+    }
+
+    #[test]
+    fn test_btc_per_kb_to_sat_per_vb() {
+        use bitcoincore_rpc::bitcoin::Amount;
+
+        // 0.00001 BTC/kB = 1000 sat/kB = 1 sat/vB
+        assert!(
+            (btc_per_kb_to_sat_per_vb(Amount::from_btc(0.00001).unwrap()) - 1.0).abs() < 0.0001
+        );
+
+        // 0.0001 BTC/kB = 10000 sat/kB = 10 sat/vB
+        assert!(
+            (btc_per_kb_to_sat_per_vb(Amount::from_btc(0.0001).unwrap()) - 10.0).abs() < 0.0001
+        );
+
+        // 0.00001198 BTC/kB = 1198 sat/kB = 1.198 sat/vB (real example from blockstream)
+        assert!(
+            (btc_per_kb_to_sat_per_vb(Amount::from_btc(0.00001198).unwrap()) - 1.198).abs()
+                < 0.0001
+        );
+
+        // 0.0005 BTC/kB = 50000 sat/kB = 50 sat/vB (high fee scenario)
+        assert!(
+            (btc_per_kb_to_sat_per_vb(Amount::from_btc(0.0005).unwrap()) - 50.0).abs() < 0.0001
+        );
+
+        // 0 BTC/kB = 0 sat/vB
+        assert_eq!(
+            btc_per_kb_to_sat_per_vb(Amount::from_btc(0.0).unwrap()),
+            0.0
+        );
     }
 }

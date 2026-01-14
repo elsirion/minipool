@@ -226,6 +226,43 @@ else
     print_fail "JSON with keys 1, 6, 144" "$minipool_fees"
 fi
 
+# Test /api/fee-estimates values are in sat/vB (not BTC/kB)
+# Valid sat/vB values should be between 0.5 and 10000 (not tiny like 0.00001)
+print_test "/api/fee-estimates (values in sat/vB range)"
+fee_1_block=$(echo "$minipool_fees" | jq -r '.["1"] // 0')
+if [ -n "$fee_1_block" ]; then
+    # Check if fee is in reasonable sat/vB range (0.5 to 10000)
+    # BTC/kB values would be like 0.00001 which would fail this check
+    is_valid=$(echo "$fee_1_block" | awk '{if ($1 >= 0.5 && $1 <= 10000) print "yes"; else print "no"}')
+    if [ "$is_valid" = "yes" ]; then
+        print_pass
+        echo "  (1-block fee: $fee_1_block sat/vB)"
+    else
+        print_fail "0.5 to 10000 sat/vB" "$fee_1_block (likely BTC/kB if tiny)"
+    fi
+else
+    print_skip "could not parse fee estimate"
+fi
+
+# Compare with blockstream to verify values are close
+print_test "/api/fee-estimates (compare with blockstream)"
+blockstream_fees=$(curl -s "$BLOCKSTREAM_URL/api/fee-estimates" 2>/dev/null)
+minipool_fee_1=$(echo "$minipool_fees" | jq -r '.["1"] // 0')
+blockstream_fee_1=$(echo "$blockstream_fees" | jq -r '.["1"] // 0')
+if [ -n "$minipool_fee_1" ] && [ -n "$blockstream_fee_1" ] && [ "$blockstream_fee_1" != "0" ]; then
+    # Allow 50% variance since fee estimates can differ between nodes
+    ratio=$(echo "$minipool_fee_1 $blockstream_fee_1" | awk '{if ($2 > 0) print $1/$2; else print 0}')
+    is_close=$(echo "$ratio" | awk '{if ($1 >= 0.5 && $1 <= 2.0) print "yes"; else print "no"}')
+    if [ "$is_close" = "yes" ]; then
+        print_pass
+        echo "  (minipool: $minipool_fee_1, blockstream: $blockstream_fee_1, ratio: $ratio)"
+    else
+        print_fail "within 50% of $blockstream_fee_1" "$minipool_fee_1 (ratio: $ratio)"
+    fi
+else
+    print_skip "could not compare fee estimates"
+fi
+
 print_header "Testing Error Handling"
 
 # Test invalid block hash
