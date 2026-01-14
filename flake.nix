@@ -69,6 +69,11 @@
           # Build the crates as part of `nix flake check` for convenience
           inherit minipool;
 
+          # Run tests on the workspace source
+          minipool-test = craneLib.cargoTest (commonArgs // {
+            inherit cargoArtifacts;
+          });
+
           # Run clippy (and deny all warnings) on the workspace source,
           # again, reusing the dependency artifacts from above.
           minipool-clippy = craneLib.cargoClippy (commonArgs // {
@@ -117,12 +122,13 @@
             # Build dependencies
             pkg-config
             openssl
-            
+
             # Development tools
             cargo-watch
             cargo-audit
             cargo-outdated
             cargo-edit
+            just
           ];
 
           # Set up rust-analyzer for the project
