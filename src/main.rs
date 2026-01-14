@@ -14,7 +14,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use bitcoincore_rpc::bitcoin::{consensus::deserialize, BlockHash, Transaction, Txid};
+use bitcoincore_rpc::bitcoin::{
+    consensus::deserialize, consensus::serialize, BlockHash, Transaction, Txid,
+};
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use clap::Parser;
 use serde::Serialize;
@@ -164,6 +166,14 @@ struct TxResponse {
     status: TxStatus,
 }
 
+/// Esplora-compatible merkle proof response
+#[derive(Serialize)]
+struct MerkleProofResponse {
+    block_height: u64,
+    merkle: Vec<String>,
+    pos: usize,
+}
+
 /// Esplora-compatible block response
 #[derive(Serialize)]
 struct BlockResponse {
@@ -265,6 +275,11 @@ async fn start_main_server(config: Config) -> Result<()> {
             get(get_block_raw),
         ),
         RouteInfo::new(
+            "/api/block/{hash}/header",
+            "Get the block header as hex for a specific block hash.",
+            get(get_block_header),
+        ),
+        RouteInfo::new(
             "/api/block/{hash}",
             "Get block information for a specific block hash.",
             get(get_block_info),
@@ -280,8 +295,13 @@ async fn start_main_server(config: Config) -> Result<()> {
             get(get_tx_status),
         ),
         RouteInfo::new(
+            "/api/tx/{txid}/merkle-proof",
+            "Get merkle proof for a transaction (JSON format).",
+            get(get_tx_merkle_proof),
+        ),
+        RouteInfo::new(
             "/api/tx/{txid}/merkleblock-proof",
-            "Get merkle inclusion proof for a transaction.",
+            "Get merkle inclusion proof for a transaction (binary format).",
             get(get_tx_merkleblock_proof),
         ),
         RouteInfo::new_post(
@@ -353,11 +373,11 @@ async fn get_block_by_height(
     }
 }
 
-fn get_fee_rate_blocking(client: &Client, blocks: u16) -> Result<f64, bitcoincore_rpc::Error> {
-    let estimate = client.estimate_smart_fee(blocks, None)?;
+fn get_fee_rate_blocking(rpc: &Client, blocks: u16) -> Result<f64, bitcoincore_rpc::Error> {
+    let estimate = rpc.estimate_smart_fee(blocks, None)?;
     Ok(estimate
         .fee_rate
-        .map(|fee_rate| fee_rate.to_btc())
+        .map(|fee_rate: bitcoincore_rpc::bitcoin::Amount| fee_rate.to_btc())
         .unwrap_or_else(|| {
             warn!(
                 "No fee rate estimate available for {} blocks, using default",
@@ -393,10 +413,42 @@ async fn get_block_raw(
     match BlockHash::from_str(&hash) {
         Ok(block_hash) => {
             let rpc = state.rpc.clone();
-            match tokio::task::spawn_blocking(move || rpc.get_block_hex(&block_hash)).await {
-                Ok(Ok(block_hex)) => (StatusCode::OK, block_hex).into_response(),
+            match tokio::task::spawn_blocking(move || rpc.get_block(&block_hash)).await {
+                Ok(Ok(block)) => {
+                    let bytes = serialize(&block);
+                    (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                        bytes,
+                    )
+                        .into_response()
+                }
                 Ok(Err(e)) => handle_rpc_error(e, "Block", &hash).into_response(),
                 Err(e) => handle_task_error(e, "get raw block").into_response(),
+            }
+        }
+        Err(e) => {
+            warn!("Invalid block hash: {}: {}", hash, e);
+            (StatusCode::BAD_REQUEST, "Invalid block hash").into_response()
+        }
+    }
+}
+
+/// GET /api/block/{hash}/header - Get block header as hex
+async fn get_block_header(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+) -> impl IntoResponse {
+    match BlockHash::from_str(&hash) {
+        Ok(block_hash) => {
+            let rpc = state.rpc.clone();
+            match tokio::task::spawn_blocking(move || rpc.get_block_header(&block_hash)).await {
+                Ok(Ok(header)) => {
+                    let header_bytes = serialize(&header);
+                    (StatusCode::OK, hex::encode(header_bytes)).into_response()
+                }
+                Ok(Err(e)) => handle_rpc_error(e, "Block", &hash).into_response(),
+                Err(e) => handle_task_error(e, "get block header").into_response(),
             }
         }
         Err(e) => {
@@ -596,6 +648,132 @@ async fn get_tx_status(
     }
 }
 
+/// Compute merkle proof for a transaction at given position in a list of txids
+fn compute_merkle_proof(txids: &[Txid], pos: usize) -> Vec<String> {
+    use bitcoincore_rpc::bitcoin::hashes::{sha256d, Hash, HashEngine};
+
+    if txids.is_empty() || pos >= txids.len() {
+        return vec![];
+    }
+
+    // Txid::to_byte_array() returns bytes in internal/consensus order
+    // For merkle tree computation in Bitcoin, we use these directly
+    let mut hashes: Vec<[u8; 32]> = txids.iter().map(|txid| txid.to_byte_array()).collect();
+
+    let mut proof = Vec::new();
+    let mut idx = pos;
+
+    // Build merkle tree level by level
+    while hashes.len() > 1 {
+        // Get sibling hash for proof
+        let sibling_idx = if idx.is_multiple_of(2) {
+            idx + 1
+        } else {
+            idx - 1
+        };
+        let sibling = if sibling_idx < hashes.len() {
+            hashes[sibling_idx]
+        } else {
+            // Odd number of elements, duplicate last one
+            hashes[idx]
+        };
+
+        // Reverse bytes from internal to display order for JSON output
+        let mut display_hash = sibling;
+        display_hash.reverse();
+        proof.push(hex::encode(display_hash));
+
+        // Compute next level - hash pairs together
+        let mut next_level = Vec::new();
+        for chunk in hashes.chunks(2) {
+            let left = &chunk[0];
+            let right = if chunk.len() > 1 {
+                &chunk[1]
+            } else {
+                &chunk[0]
+            };
+
+            let mut engine = sha256d::Hash::engine();
+            engine.input(left);
+            engine.input(right);
+            let hash = sha256d::Hash::from_engine(engine);
+            next_level.push(hash.to_byte_array());
+        }
+        hashes = next_level;
+        idx /= 2;
+    }
+
+    proof
+}
+
+/// GET /api/tx/{txid}/merkle-proof - Get merkle proof in JSON format
+async fn get_tx_merkle_proof(
+    State(state): State<AppState>,
+    Path(txid): Path<String>,
+) -> impl IntoResponse {
+    match Txid::from_str(&txid) {
+        Ok(tx_id) => {
+            let rpc = state.rpc.clone();
+            match tokio::task::spawn_blocking(move || {
+                // Get transaction info to find block hash
+                let tx_info = rpc.get_raw_transaction_info(&tx_id, None)?;
+
+                let block_hash = match tx_info.blockhash {
+                    Some(hash) => hash,
+                    None => {
+                        return Err(bitcoincore_rpc::Error::JsonRpc(
+                            bitcoincore_rpc::jsonrpc::Error::Rpc(
+                                bitcoincore_rpc::jsonrpc::error::RpcError {
+                                    code: -5,
+                                    message: "Transaction not yet in block".to_string(),
+                                    data: None,
+                                },
+                            ),
+                        ))
+                    }
+                };
+
+                // Get block info for height and txids
+                let block_info = rpc.get_block_info(&block_hash)?;
+
+                // Find position of tx in block
+                let pos = block_info
+                    .tx
+                    .iter()
+                    .position(|t| *t == tx_id)
+                    .ok_or_else(|| {
+                        bitcoincore_rpc::Error::JsonRpc(bitcoincore_rpc::jsonrpc::Error::Rpc(
+                            bitcoincore_rpc::jsonrpc::error::RpcError {
+                                code: -5,
+                                message: "Transaction not found in block".to_string(),
+                                data: None,
+                            },
+                        ))
+                    })?;
+
+                // Compute merkle proof
+                let merkle = compute_merkle_proof(&block_info.tx, pos);
+
+                Ok::<_, bitcoincore_rpc::Error>(MerkleProofResponse {
+                    block_height: block_info.height as u64,
+                    merkle,
+                    pos,
+                })
+            })
+            .await
+            {
+                Ok(Ok(response)) => Json(response).into_response(),
+                Ok(Err(e)) => handle_rpc_error(e, "Transaction", &txid).into_response(),
+                Err(e) => handle_task_error(e, "get merkle proof").into_response(),
+            }
+        }
+        Err(e) => {
+            warn!("Invalid txid: {}: {}", txid, e);
+            (StatusCode::BAD_REQUEST, "Invalid txid").into_response()
+        }
+    }
+}
+
 /// GET /api/tx/{txid}/merkleblock-proof - Get merkle inclusion proof
 async fn get_tx_merkleblock_proof(
     State(state): State<AppState>,
@@ -757,4 +935,122 @@ async fn index(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn fallback() -> impl IntoResponse {
     Redirect::temporary("/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn test_compute_merkle_proof_block_100000() {
+        // Block 100000 has 4 transactions
+        // We test the merkle proof for the coinbase tx (position 0)
+        // Expected proof from blockstream.info:
+        // {"block_height":100000,"merkle":["fff2525b8931402dd09222c50775608f75787bd2b87e56995a7bdd30f79702c4","8e30899078ca1813be036a073bbf80b86cdddde1c96e9e9c99e9e3782df4ae49"],"pos":0}
+
+        let txids: Vec<Txid> = vec![
+            Txid::from_str("8c14f0db3df150123e6f3dbbf30f8b955a8249b62ac1d1ff16284aefa3d06d87")
+                .unwrap(),
+            Txid::from_str("fff2525b8931402dd09222c50775608f75787bd2b87e56995a7bdd30f79702c4")
+                .unwrap(),
+            Txid::from_str("6359f0868171b1d194cbee1af2f16ea598ae8fad666d9b012c8ed2b79a236ec4")
+                .unwrap(),
+            Txid::from_str("e9a66845e05d5abc0ad04ec80f774a7e585c6e8db975962d069a522137b80c1d")
+                .unwrap(),
+        ];
+
+        // Test position 0 (coinbase tx)
+        let proof = compute_merkle_proof(&txids, 0);
+        assert_eq!(proof.len(), 2);
+        assert_eq!(
+            proof[0],
+            "fff2525b8931402dd09222c50775608f75787bd2b87e56995a7bdd30f79702c4"
+        );
+        assert_eq!(
+            proof[1],
+            "8e30899078ca1813be036a073bbf80b86cdddde1c96e9e9c99e9e3782df4ae49"
+        );
+    }
+
+    #[test]
+    fn test_compute_merkle_proof_position_1() {
+        // Test merkle proof for position 1 (second tx in block 100000)
+        let txids: Vec<Txid> = vec![
+            Txid::from_str("8c14f0db3df150123e6f3dbbf30f8b955a8249b62ac1d1ff16284aefa3d06d87")
+                .unwrap(),
+            Txid::from_str("fff2525b8931402dd09222c50775608f75787bd2b87e56995a7bdd30f79702c4")
+                .unwrap(),
+            Txid::from_str("6359f0868171b1d194cbee1af2f16ea598ae8fad666d9b012c8ed2b79a236ec4")
+                .unwrap(),
+            Txid::from_str("e9a66845e05d5abc0ad04ec80f774a7e585c6e8db975962d069a522137b80c1d")
+                .unwrap(),
+        ];
+
+        let proof = compute_merkle_proof(&txids, 1);
+        assert_eq!(proof.len(), 2);
+        // At position 1, sibling is position 0 (the coinbase)
+        assert_eq!(
+            proof[0],
+            "8c14f0db3df150123e6f3dbbf30f8b955a8249b62ac1d1ff16284aefa3d06d87"
+        );
+    }
+
+    #[test]
+    fn test_compute_merkle_proof_single_tx() {
+        // Block with single transaction should have empty proof
+        let txids: Vec<Txid> = vec![Txid::from_str(
+            "8c14f0db3df150123e6f3dbbf30f8b955a8249b62ac1d1ff16284aefa3d06d87",
+        )
+        .unwrap()];
+
+        let proof = compute_merkle_proof(&txids, 0);
+        assert!(proof.is_empty());
+    }
+
+    #[test]
+    fn test_compute_merkle_proof_two_txs() {
+        // Block with two transactions
+        let txids: Vec<Txid> = vec![
+            Txid::from_str("8c14f0db3df150123e6f3dbbf30f8b955a8249b62ac1d1ff16284aefa3d06d87")
+                .unwrap(),
+            Txid::from_str("fff2525b8931402dd09222c50775608f75787bd2b87e56995a7bdd30f79702c4")
+                .unwrap(),
+        ];
+
+        // Position 0 should have tx1 as sibling
+        let proof = compute_merkle_proof(&txids, 0);
+        assert_eq!(proof.len(), 1);
+        assert_eq!(
+            proof[0],
+            "fff2525b8931402dd09222c50775608f75787bd2b87e56995a7bdd30f79702c4"
+        );
+
+        // Position 1 should have tx0 as sibling
+        let proof = compute_merkle_proof(&txids, 1);
+        assert_eq!(proof.len(), 1);
+        assert_eq!(
+            proof[0],
+            "8c14f0db3df150123e6f3dbbf30f8b955a8249b62ac1d1ff16284aefa3d06d87"
+        );
+    }
+
+    #[test]
+    fn test_compute_merkle_proof_empty() {
+        let txids: Vec<Txid> = vec![];
+        let proof = compute_merkle_proof(&txids, 0);
+        assert!(proof.is_empty());
+    }
+
+    #[test]
+    fn test_compute_merkle_proof_out_of_bounds() {
+        let txids: Vec<Txid> = vec![Txid::from_str(
+            "8c14f0db3df150123e6f3dbbf30f8b955a8249b62ac1d1ff16284aefa3d06d87",
+        )
+        .unwrap()];
+
+        // Position out of bounds should return empty
+        let proof = compute_merkle_proof(&txids, 5);
+        assert!(proof.is_empty());
+    }
 }
